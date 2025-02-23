@@ -1,149 +1,198 @@
-module histogram1(
-    input rst_n,
-
-    input cam_clk,
-    input cam_vsync,
-    input cam_href,
-    input cam_valid,
-    input [7:0] cam_gray,
-
-    output post_frame_vsync,
-    output post_frame_href,
-    output post_frame_clken,
-    output [7:0] post_img_Y,
-
-    input vga_clk,
-    input vga_rd_en,
-    input [7:0] vga_rd_addr,
-    output [18:0] vga_rd_data
+module histogram_equ
+#(
+    parameter  [9:0] IMG_HDISP = 10'd640,  //640*480
+    parameter  [9:0] IMG_VDISP = 10'd480
+)
+(
+    input       clk,
+    input       rst_n,
+    input       per_frame_vsync,
+    input       per_frame_href,
+    input       per_frame_clken,
+    input   [7:0] per_img_Y,
+    output      post_frame_vsync,
+    output      post_frame_href,
+    output      post_frame_clken,
+    output  [7:0] post_img_Y
 );
 
-wire [18:0] wr_data;
-wire [18:0] rd_data;
-reg wr_en;
-reg vsync_delay;
+localparam IMG_TOTAL_PIXEL = 307200;  //一帧图像的总像素数
+localparam IMG_MAX_GRAY   = 256;     //图像中可能的灰度等级数量
 
-reg [7:0] ram_addr_b;
-reg ram_rd_b;
-wire [18:0] ram_rd_q_b;
+wire [18:0] ram_his_rd_data;
+reg        ram_his_wr_en;
+reg        vsync_delay;
 
-reg ram_wr_b;
+reg  [7:0] ram_his_addr_b;
+reg        ram_his_rd_b;
+wire [18:0] ram_his_rd_data_b;
 
-reg ram_vga_wr;
-reg [7:0] ram_vga_wraddr;
-reg [18:0] ram_vga_data;
+reg ram_his_wr_b;
 
-///main code
-//当摄像头输入的灰度数据有效时，会先进行读RAM操作，然后将读出的数据加1后，再次写入相同地址
+reg ram_accu_wr;
+reg [7:0] ram_accu_wraddr;
+wire [18:0] ram_accu_wrdata;
+
+wire [18:0] ram_accu_rddata;
+
+/////////////////////////////////////////
+//    直方图统计
+/////////////////////////////////////////
+
+//摄像头输入的灰度数据有效时，会先进行读RAM操作，然后将读出的数据加1后，再次写入相同地址
 //读操作需要一个时钟周期，因此“写使能”直接将输入的Valid信号延迟一个时钟周期即可
-always @(posedge cam_clk or negedge rst_n) begin
-    if (!rst_n)
-        wr_en <= 1'b0;
+always @(posedge clk or negedge rst_n) begin
+    if(!rst_n)
+        ram_his_wr_en <= 1'b0;
     else
-        wr_en <= cam_valid;
+        ram_his_wr_en <= per_frame_clken;
 end
 
 //双端口RAM，用于统计一帧图像的灰度直方图
-ram_2port u_ram_2port(
+ram_2port_his u_ram_2port_his(
     //端口A：摄像头输出的灰度数据作为RAM地址，先将该地址中的数据读出来，加1后再写入RAM1中
-    .clock_a ( cam_clk ),
-    .aclr_a ( !rst_n ),
-    .rden_a ( cam_valid ), // 读端口A
-    .address_a ( cam_gray ),
-    .q_a ( rd_data ),
-    .wren_a ( wr_en ), // 写端口A
-    .data_a ( rd_data+1 ), // 直方图统计过程中，写入RAM的数据为（当前地址的数据+1）
+    .clock_a(clk),
+    .aclr_a(!rst_n),
+    .rden_a(per_frame_clken),  //读端口A
+    .address_a(per_img_Y),
+    .q_a(ram_his_rd_data),
+    .wren_a(ram_his_wr_en),  //写端口A
+    .data_a(ram_his_rd_data+1),  //直方图统计过程中，写入RAM的数据为（当前地址的数据+1）
 
     //端口B：一帧结束后读出RAM中的数据进行寄存，下一帧开始前将RAM初始化为0
-    .clock_b ( vga_clk ),
-    .aclr_b ( 1'b0 ),
-    .rden_b ( ram_rd_b ), // 读端口B
-    .address_b ( ram_addr_b ),
-    .q_b ( ram_rd_q_b ),
-    .wren_b ( ram_wr_b ), // 写端口B
-    .data_b ( 32'd0 ) // 初始化过程中，写入RAM的数据为0
+    .clock_b(clk),
+    .aclr_b(1'b0),
+    .rden_b(ram_his_rd_b),  //读端口B
+    .address_b(ram_his_addr_b),
+    .q_b(ram_his_rd_data_b),
+    .wren_b(ram_his_wr_b),  //写端口B
+    .data_b(32'd0)  //初始化过程中，写入RAM的数据为0
 );
 
 //采集摄像头场同步信号上升/下降沿
 wire vsync_negedge;
 wire vsync_posedge;
 
-
-always @(posedge cam_clk or negedge rst_n) begin
+always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
         vsync_delay <= 1'b0;
     else
-        vsync_delay <= cam_vsync;
+        vsync_delay <= per_frame_vsync;
 end
 
-assign vsync_negedge = vsync_delay & (!cam_vsync);
-assign vsync_posedge = (!vsync_delay) & cam_vsync;
+assign vsync_negedge = vsync_delay & (!per_frame_vsync);
+assign vsync_posedge = (!vsync_delay) & per_frame_vsync;
 
 //场同步“上升沿”表示前一帧直方图统计结束，此时将RAM中的数据读出，寄存到VGA显存RAM中
-always @(posedge vga_clk or negedge rst_n) begin
+always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
-        ram_rd_b <= 1'b0;
+        ram_his_rd_b <= 1'b0;
     else begin
-        if (vsync_posedge) // 上升沿拉高端口b的读使能，并维持256个时钟周期
-            ram_rd_b <= 1'b1;
-        else if (ram_addr_b == 8'd255)
-            ram_rd_b <= 1'b0;
+        if (vsync_posedge) //上升沿拉高端口b的读使能，并维持256个时钟周期
+            ram_his_rd_b <= 1'b1;
+        else if (ram_his_addr_b == 8'd255)
+            ram_his_rd_b <= 1'b0;
     end
 end
 
 //场同步“下降沿”表示新的一帧开始，此时将RAM初始化为0
 //RAM的异步复位端口只能将输出端置0，初始化需要通过写操作进行
-always @(posedge vga_clk or negedge rst_n) begin
+always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
-        ram_wr_b <= 1'b0;
+        ram_his_wr_b <= 1'b0;
     else begin
-        if (vsync_negedge)
-            ram_wr_b <= 1'b1; // 下降沿拉高端口b的写使能，并维持256个时钟周期
-        else if (ram_addr_b == 8'd255)
-            ram_wr_b <= 1'b0;
+        if (vsync_negedge) //下降沿拉高端口b的写使能，并维持256个时钟周期
+            ram_his_wr_b <= 1'b1;
+        else if (ram_his_addr_b == 8'd255)
+            ram_his_wr_b <= 1'b0;
     end
 end
 
 //对RAM的端口B进行读写操作时，都要遍历整个RAM的地址空间
-always @(posedge vga_clk or negedge rst_n) begin
+always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
-        ram_addr_b <= 8'd0;
-    else begin
-        if (ram_rd_b) // 遍历读操作地址
-            ram_addr_b <= ram_addr_b + 1'b1;
-        else if (ram_wr_b) // 遍历写操作地址
-            ram_addr_b <= ram_addr_b + 1'b1;
+        ram_his_addr_b <= 8'd0;
+    else
+        if (ram_his_rd_b) //遍历读操作地址
+            ram_his_addr_b <= ram_his_addr_b + 1'b1;
+        else if (ram_his_wr_b) //遍历写操作地址
+            ram_his_addr_b <= ram_his_addr_b + 1'b1;
         else
-            ram_addr_b <= 8'd0;
+            ram_his_addr_b <= 8'd0;
+end
+
+//////////////////////////////////////////
+//    计算累积直方图
+/////////////////////////////////////////
+
+//从前一个RAM中读出直方图统计信息，延迟一个时钟周期拉高VGA显存RAM的写使能
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)
+        ram_accu_wr <= 1'b0;
+    else
+        ram_accu_wr <= ram_his_rd_b;
+end
+
+reg [18:0] his_sum; //累积直方图结果
+
+//前一个RAM端口B读数据有效时，对输出的直方图进行累加
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)
+        his_sum <= 19'd0;
+    else begin
+        if (vsync_negedge)
+            his_sum <= 19'd0;
+        else if (ram_accu_wr)
+            his_sum <= his_sum + ram_his_rd_data_b;
     end
 end
 
-//从前一个RAM中读出直方图统计信息，延迟一个时钟周期拉高VGA显存RAM的写使能
-always @(posedge vga_clk or negedge rst_n) begin
+assign ram_accu_wrdata = his_sum + ram_his_rd_data_b;
+
+
+//////////////////////////////////////////
+//    直方图均衡
+//////////////////////////////////////////
+
+reg [26:0] data_mult;  //乘法运算结果
+
+always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
-        ram_vga_wr <= 1'b0;
+        data_mult <= 27'd0;
     else
-        ram_vga_wr <= ram_rd_b;
+        data_mult <= ram_accu_rddata * (IMG_MAX_GRAY - 1);
 end
 
-//将直方图统计信息寄存到VGA显存RAM
-always @(posedge vga_clk or negedge rst_n) begin
+reg [7:0] data_div; //除法运算结果
+
+always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
-        ram_vga_wraddr <= 8'd0;
+        data_div <= 8'd0;
     else
-        ram_vga_wraddr <= ram_addr_b;
+        data_div <= data_mult / IMG_TOTAL_PIXEL;
 end
 
-//VGA显存RAM，用于在每一帧图像的直方图信息统计完毕后，寄存统计结果，该结果会用于在屏幕上显示直方图
-ram_2port_vga ram_2port_vga_inst (
-    .clock (vga_clk),
-    .aclr (!rst_n),
-    .wren (ram_vga_wr),
-    .wraddress (ram_vga_wraddr),
-    .data (ram_rd_q_b), // 写入的数据是从前一个RAM端口B读出的数据
-    .rden (vga_rd_en),
-    .rdaddress (vga_rd_addr),
-    .q (vga_rd_data) // VGA刷新屏幕时，从VGA显存RAM中读取各灰度级的直方图信息
-);
+//-----------------------------------
+//延迟三个时钟周期以达到与数据同步
+reg [2:0] per_frame_vsync_r;
+reg [2:0] per_frame_href_r;
+reg [2:0] per_frame_clken_r;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        per_frame_vsync_r <= 0;
+        per_frame_href_r <= 0;
+        per_frame_clken_r <= 0;
+    end else begin
+        per_frame_vsync_r <= {per_frame_vsync_r[1:0], per_frame_vsync};
+        per_frame_href_r <= {per_frame_href_r[1:0], per_frame_href};
+        per_frame_clken_r <= {per_frame_clken_r[1:0], per_frame_clken};
+    end
+end
+
+assign post_frame_vsync = per_frame_vsync_r[2];
+assign post_frame_href = per_frame_href_r[2];
+assign post_frame_clken = per_frame_clken_r[2];
+assign post_img_Y = post_frame_href ? data_div : 8'd0;
 
 endmodule
